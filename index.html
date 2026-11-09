@@ -105,6 +105,9 @@ h1 .name { display: block; font-size: clamp(22px, 5vw, 32px); letter-spacing: .1
 .train .wheel { transform-box: fill-box; transform-origin: center; animation: spin .28s linear infinite; }
 @keyframes spin { to { transform: rotate(-360deg); } }
 .board-btn:disabled { cursor: default; filter: brightness(.85); }
+/* design_v2: 탑승 연출 3초 동안만 화면 전체를 덮는 3D 역 (떨림 여유로 사방 12px 크게) */
+.rail3d { position: fixed; top: -12px; left: -12px; z-index: 40; pointer-events: none; visibility: hidden; opacity: 0; will-change: opacity, transform; }
+.rail3d.on { visibility: visible; }
 /* 티켓 */
 .ticket-stage { --tw: min(90vw, 560px); --u: calc(var(--tw) / 600); position: relative; z-index: 45; display: flex; flex-direction: column; align-items: center; gap: 16px; margin-top: 10px; perspective: 1100px; }
 .ticket-stage[hidden] { display: none; }
@@ -618,6 +621,612 @@ document.getElementById('copy-url').addEventListener('click', async () => {
   resize(); addEventListener('resize', resize); requestAnimationFrame(draw);
 })();
 
+// ── design_v2: 3D 탑승 연출 ──
+// three.js(버전 고정)를 미리 불러 장면을 만들어 두고, 탑승하기를 누르면 3초 동안만 그린다.
+// 불러오기·WebGL이 실패하면 ready()가 false라서 아래 2D 연출(v27)로 대신한다.
+// 단위는 미터. 카메라는 승강장 무릎 높이(0.5m), 기차는 카메라 왼쪽 선로(x=-2)를 따라 +z 방향(카메라 쪽)으로 달린다.
+const Rail3D = (function () {
+  const LIB = 'https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js';
+  let T, R = null, state = 'idle';
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const smooth = (x) => { x = clamp01(x); return x * x * (3 - 2 * x); };
+
+  function load() {
+    if (state !== 'idle') return;
+    state = 'loading';
+    const s = document.createElement('script');
+    s.src = LIB; s.async = true; s.crossOrigin = 'anonymous';
+    s.onerror = () => { state = 'failed'; };
+    s.onload = () => {
+      T = window.THREE;
+      if (!T) { state = 'failed'; return; }
+      // 티켓·표지판 글씨를 캔버스에 그리기 전에 글꼴을 기다린다(최대 3초)
+      const f = document.fonts;
+      const fonts = f ? Promise.all([
+        f.load('600 24px Cinzel'), f.load('30px "Pinyon Script"'),
+        f.load('800 25px "Nanum Myeongjo"', '2026년 12월 26일 (토) 오후 6시 더블랭크 20'),
+        f.load('700 21px "Nanum Myeongjo"', 'HRA 20기 일동'),
+      ]).catch(() => {}) : Promise.resolve();
+      Promise.race([fonts, new Promise((r) => setTimeout(r, 3000))]).then(() => {
+        (window.requestIdleCallback || setTimeout)(() => {
+          try { build(); state = 'ready'; }
+          catch (e) { console.warn('3D 연출을 쓸 수 없어 2D 연출로 대신합니다.', e); if (R && R.canvas) R.canvas.remove(); R = null; state = 'failed'; }
+        });
+      });
+    };
+    document.head.appendChild(s);
+  }
+
+  // ── 캔버스로 그리는 질감 ──
+  function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return [c, c.getContext('2d')]; }
+  function tex(c, rx, ry) {
+    const t = new T.CanvasTexture(c);
+    if (rx) { t.wrapS = t.wrapT = T.RepeatWrapping; t.repeat.set(rx, ry); }
+    t.anisotropy = R.aniso; return t;
+  }
+  function rr(x, a, b, w, h, r) {
+    x.beginPath(); x.moveTo(a + r, b);
+    x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r);
+    x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath();
+  }
+  function spacedWidth(x, s, sp) { return sp ? [...s].reduce((w, ch) => w + x.measureText(ch).width + sp, 0) : x.measureText(s).width; }
+  function drawSpaced(x, s, px, y, sp) {
+    if (!sp) { x.fillText(s, px, y); return px + x.measureText(s).width; }
+    for (const ch of s) { x.fillText(ch, px, y); px += x.measureText(ch).width + sp; }
+    return px;
+  }
+  // 글꼴이 섞인 한 줄을 가운데 정렬로 그림: parts = [[font, text, color, letterSpacing], ...]
+  function line(x, parts, cx, y) {
+    let total = 0;
+    for (const p of parts) { x.font = p[0]; total += spacedWidth(x, p[1], p[3]); }
+    let px = cx - total / 2;
+    x.textAlign = 'left'; x.textBaseline = 'middle';
+    for (const p of parts) { x.font = p[0]; x.fillStyle = p[2]; px = drawSpaced(x, p[1], px, y, p[3]); }
+  }
+  function radial(stops) {
+    const [c, x] = makeCanvas(128, 128), g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+    for (const [o, col] of stops) g.addColorStop(o, col);
+    x.fillStyle = g; x.fillRect(0, 0, 128, 128); return tex(c);
+  }
+  function brickTex(L, H) {
+    const [c, x] = makeCanvas(256, 128), tones = ['#5a3022', '#52291d', '#4d281c', '#5f3424', '#55301f'];
+    x.fillStyle = '#24150d'; x.fillRect(0, 0, 256, 128);
+    const rows = 12, rh = 128 / rows, bw = 32;
+    for (let r = 0; r < rows; r++) for (let i = -1; i < 9; i++) {
+      x.fillStyle = tones[(((r * 7 + i * 3) % 5) + 5) % 5];
+      x.fillRect(i * bw + (r % 2) * bw / 2 + 1, r * rh + 1, bw - 2, rh - 2);
+    }
+    return tex(c, L / 2, H);
+  }
+  function slabTex(L) {
+    const [c, x] = makeCanvas(256, 256);
+    x.fillStyle = '#2a2420'; x.fillRect(0, 0, 256, 256);
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+      x.fillStyle = ['#4a4038', '#51463c', '#443a33', '#4d4239'][(i * 3 + j) % 4];
+      x.fillRect(i * 64 + 1, j * 64 + 1, 62, 62);
+    }
+    return tex(c, 2, L / 2.5);
+  }
+  // 유리 지붕: 낮빛이 비치는 회청색 유리 + 검은 철골 격자·가새
+  function glassTex(L) {
+    const [c, x] = makeCanvas(256, 256), g = x.createLinearGradient(0, 0, 256, 0);
+    g.addColorStop(0, '#2e2b29'); g.addColorStop(0.3, '#6c767a'); g.addColorStop(0.5, '#8e989b'); g.addColorStop(0.7, '#6c767a'); g.addColorStop(1, '#2e2b29');
+    x.fillStyle = g; x.fillRect(0, 0, 256, 256);
+    x.strokeStyle = '#1e1b1a'; x.lineWidth = 5;
+    for (let i = 0; i <= 8; i++) { x.beginPath(); x.moveTo(i * 32, 0); x.lineTo(i * 32, 256); x.stroke(); }
+    x.lineWidth = 4;
+    for (const y of [0, 128, 256]) { x.beginPath(); x.moveTo(0, y); x.lineTo(256, y); x.stroke(); }
+    x.lineWidth = 2; x.globalAlpha = 0.6;
+    for (let i = 0; i < 8; i++) { x.beginPath(); x.moveTo(i * 32, 0); x.lineTo(i * 32 + 32, 128); x.moveTo(i * 32 + 32, 128); x.lineTo(i * 32, 256); x.stroke(); }
+    return tex(c, 1, L / 5);
+  }
+  // 뭉게구름 증기: 둥근 덩어리 여러 개를 겹치고 아래쪽에 살짝 그늘
+  function cloudTex() {
+    const [c, x] = makeCanvas(256, 256);
+    const blobs = [[128, 140, 92], [88, 150, 62], [170, 150, 64], [112, 104, 60], [154, 108, 56], [128, 176, 66], [74, 120, 44], [186, 124, 44]];
+    for (const [bx, by, r] of blobs) {
+      const g = x.createRadialGradient(bx, by, 0, bx, by, r);
+      g.addColorStop(0, 'rgba(255,255,255,.95)'); g.addColorStop(0.6, 'rgba(255,255,255,.55)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      x.fillStyle = g; x.beginPath(); x.arc(bx, by, r, 0, 7); x.fill();
+    }
+    x.globalCompositeOperation = 'source-atop';
+    const sh = x.createLinearGradient(0, 70, 0, 250);
+    sh.addColorStop(0, 'rgba(255,255,255,0)'); sh.addColorStop(1, 'rgba(150,140,132,.55)');
+    x.fillStyle = sh; x.fillRect(0, 0, 256, 256);
+    return tex(c);
+  }
+  // 승강장 위 사람 실루엣(역광을 받아 어둡게): 0 코트, 1 모자+가방, 2 짐수레 끄는 사람
+  function figureTex(kind) {
+    const [c, x] = makeCanvas(128, 256);
+    x.fillStyle = '#ffffff';
+    x.beginPath(); x.arc(64, 40, 17, 0, 7); x.fill();                       // 머리
+    if (kind === 1) { x.fillRect(42, 20, 44, 7); x.fillRect(50, 4, 28, 20); } // 모자
+    x.beginPath(); x.moveTo(40, 64); x.quadraticCurveTo(64, 54, 88, 64);      // 어깨~코트
+    x.lineTo(kind === 0 ? 98 : 92, 190); x.lineTo(kind === 0 ? 30 : 36, 190); x.closePath(); x.fill();
+    x.fillRect(46, 186, 14, 66); x.fillRect(68, 186, 14, 66);                  // 다리
+    if (kind === 1) x.fillRect(90, 150, 30, 40);                               // 가방
+    if (kind === 2) { x.fillRect(0, 120, 30, 90); x.fillRect(0, 200, 44, 6); } // 짐수레
+    return tex(c);
+  }
+  function shaftTex() {
+    const [c, x] = makeCanvas(64, 256), v = x.createLinearGradient(0, 0, 0, 256);
+    v.addColorStop(0, 'rgba(255,255,255,.9)'); v.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = v; x.fillRect(0, 0, 64, 256);
+    x.globalCompositeOperation = 'destination-in';
+    const h = x.createLinearGradient(0, 0, 64, 0);
+    h.addColorStop(0, 'rgba(0,0,0,0)'); h.addColorStop(0.5, 'rgba(0,0,0,1)'); h.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = h; x.fillRect(0, 0, 64, 256);
+    return tex(c);
+  }
+  function wheelTex() {
+    const [c, x] = makeCanvas(256, 256);
+    x.fillStyle = '#17121c'; x.beginPath(); x.arc(128, 128, 127, 0, 7); x.fill();
+    x.strokeStyle = '#c9a45c'; x.lineWidth = 14; x.beginPath(); x.arc(128, 128, 118, 0, 7); x.stroke();
+    x.globalAlpha = 0.55; x.lineWidth = 3; x.beginPath(); x.arc(128, 128, 98, 0, 7); x.stroke(); x.globalAlpha = 1;
+    x.lineWidth = 7;
+    for (let i = 0; i < 12; i++) {
+      const a = i * Math.PI / 6;
+      x.beginPath(); x.moveTo(128 + Math.cos(a) * 18, 128 + Math.sin(a) * 18); x.lineTo(128 + Math.cos(a) * 112, 128 + Math.sin(a) * 112); x.stroke();
+    }
+    x.fillStyle = '#c9a45c'; x.beginPath(); x.arc(128, 128, 20, 0, 7); x.fill();
+    return tex(c);
+  }
+  function plateTex() {
+    const [c, x] = makeCanvas(256, 256);
+    x.fillStyle = '#141014'; x.fillRect(0, 0, 256, 256);
+    x.strokeStyle = '#e2c27a'; x.lineWidth = 16; x.beginPath(); x.arc(128, 128, 118, 0, 7); x.stroke();
+    x.lineWidth = 3; x.beginPath(); x.arc(128, 128, 100, 0, 7); x.stroke();
+    line(x, [['600 62px Cinzel, Georgia, serif', '2026', '#f0d696', 2]], 128, 132);
+    return tex(c);
+  }
+  function signTex() {
+    const [c, x] = makeCanvas(512, 200);
+    x.fillStyle = '#c9aa6c'; rr(x, 0, 0, 512, 200, 28); x.fill();
+    x.fillStyle = '#f1e5c8'; rr(x, 6, 6, 500, 188, 24); x.fill();
+    const g = x.createLinearGradient(0, 0, 0, 200); g.addColorStop(0, '#1f4a3a'); g.addColorStop(1, '#163829');
+    x.fillStyle = g; rr(x, 14, 14, 484, 172, 18); x.fill();
+    line(x, [['600 34px Cinzel, Georgia, serif', 'PLATFORM', '#f1e5c8', 9]], 256, 60);
+    line(x, [['800 86px "Nanum Myeongjo", Georgia, serif', '20', '#f1e5c8', 6]], 256, 132);
+    return tex(c);
+  }
+
+  // v27 티켓을 그림 한 장으로: 같은 윤곽·금박 테두리·문장·문구 (뒷면은 문장만)
+  const OUTLINE = 'M10 2 H590 A8 8 0 0 0 598 10 V150 A15 15 0 0 0 598 180 V320 A8 8 0 0 0 590 328 H10 A8 8 0 0 0 2 320 V180 A15 15 0 0 0 2 150 V10 A8 8 0 0 0 10 2 Z';
+  const CREST = [
+    ['M60 6 L108 22 V66 C108 98 86 120 60 132 C34 120 12 98 12 66 V22 Z', 'shield', '#a7802f', 4],
+    ['M32 80 C42 74 52 74 60 80 C68 74 78 74 88 80 V100 C78 94 68 94 60 100 C52 94 42 94 32 100 Z', '#f1e4c6', '#a7802f', 1.5],
+    ['M60 80 V100', null, '#a7802f', 1.5],
+    ['M56 48 h8 v24 h-8 Z', '#f1e4c6'],
+    ['M60 30 C66 38 65 44 60 46 C55 44 54 38 60 30 Z', '#e8b84a'],
+    ['M36 44 l2 5 5 0 -4 3 1.5 5 -4.5 -3 -4.5 3 1.5 -5 -4 -3 5 0 Z', '#c9a457'],
+    ['M84 44 l2 5 5 0 -4 3 1.5 5 -4.5 -3 -4.5 3 1.5 -5 -4 -3 5 0 Z', '#c9a457'],
+  ];
+  function drawCrest(x, cx, top, w) {
+    const s = w / 120;
+    x.save(); x.translate(cx - 60 * s, top); x.scale(s, s);
+    for (const [d, fill, stroke, lw] of CREST) {
+      const p = new Path2D(d);
+      if (fill === 'shield') { const g = x.createLinearGradient(0, 0, 0, 140); g.addColorStop(0, '#8e2a2f'); g.addColorStop(1, '#5e161b'); x.fillStyle = g; x.fill(p); }
+      else if (fill) { x.fillStyle = fill; x.fill(p); }
+      if (stroke) { x.strokeStyle = stroke; x.lineWidth = lw; x.stroke(p); }
+    }
+    x.restore();
+  }
+  function drawTicket(withText) {
+    const S = 2, [c, x] = makeCanvas(600 * S, 330 * S);
+    x.scale(S, S);
+    const paper = x.createRadialGradient(300, 148, 0, 300, 148, 400);
+    paper.addColorStop(0, '#f7edd3'); paper.addColorStop(0.75, '#ecdcb6'); paper.addColorStop(1, '#d9c08e');
+    x.fillStyle = paper; x.fill(new Path2D(OUTLINE));
+    const foil = x.createLinearGradient(0, 0, 600, 330);
+    for (const [o, col] of [[0, '#f3dc9c'], [0.35, '#b98d3e'], [0.6, '#f0d38a'], [1, '#9a7230']]) foil.addColorStop(o, col);
+    x.strokeStyle = foil; x.fillStyle = foil;
+    x.lineWidth = 3; rr(x, 12, 12, 576, 306, 6); x.stroke();
+    x.lineWidth = 1.2; rr(x, 20, 20, 560, 290, 4); x.stroke();
+    for (let px = 110; px <= 488; px += 14) for (const py of [20, 310]) { x.beginPath(); x.arc(px, py, 1.6, 0, 7); x.fill(); }
+    for (const [sx, sy, tx, ty] of [[1, 1, 0, 0], [-1, 1, 600, 0], [1, -1, 0, 330], [-1, -1, 600, 330]]) {
+      x.save(); x.translate(tx, ty); x.scale(sx, sy);
+      x.lineWidth = 2.2; x.stroke(new Path2D('M22 70 V22 H70'));
+      x.lineWidth = 1.2; x.stroke(new Path2D('M30 58 V30 H58'));
+      x.lineWidth = 1.4; x.stroke(new Path2D('M22 22 L38 38'));
+      x.fill(new Path2D('M78 22 q8 -6 16 0 q-8 6 -16 0z M22 78 q-6 8 0 16 q6 -8 0 -16z'));
+      x.translate(38.5, 38.5); x.rotate(Math.PI / 4); x.fillRect(-4.5, -4.5, 9, 9);
+      x.restore();
+    }
+    if (!withText) { drawCrest(x, 300, 115, 86); return c; }
+    // 문구는 실제 티켓(DOM)에서 읽어 와서 항상 같게
+    const when = [...document.querySelectorAll('.t-when > span')].map((e) => e.textContent);
+    const from = (document.querySelector('.t-from') || {}).textContent || '';
+    const CIN = (n) => `600 ${n}px Cinzel, Georgia, serif`, PEN = (n) => `${n}px "Pinyon Script", cursive`, MJ = (w, n) => `${w} ${n}px "Nanum Myeongjo", Georgia, serif`;
+    let y = 33;
+    line(x, [[CIN(24), 'JEJU ', '#3a2819', 3.4], [PEN(30), 'to', '#2b3552', 0], [CIN(24), ' THE BLANK', '#3a2819', 3.4]], 300, y + 13); y += 30;
+    line(x, [[PEN(30), 'for ONE NIGHT only', '#2b3552', 0]], 300, y + 15); y += 34;
+    drawCrest(x, 300, y + 2, 40); y += 55;
+    line(x, [[CIN(46), 'Platform ', '#6e1a26', 2.8], [MJ(800, 46), '20', '#6e1a26', 2.8]], 300, y + 23); y += 54;
+    for (const w of when) { line(x, [[MJ(800, 25), w, '#3a2819', 0]], 300, y + 16); y += 32.5; }
+    line(x, [[MJ(700, 21), from, '#6a5641', 0]], 300, y + 17);
+    return c;
+  }
+
+  // ── 장면 만들기 ──
+  function build() {
+    const canvas = document.createElement('canvas');
+    canvas.className = 'rail3d'; canvas.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(canvas);
+    R = { canvas };
+    const renderer = new T.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+    renderer.setClearColor(0x1c120b, 1);
+    R.renderer = renderer;
+    R.aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    R.scene = new T.Scene();
+    R.scene.fog = new T.Fog(0x4a4642, 14, 170);  // 증기 낀 공기: 멀수록 회백색으로
+    R.camera = new T.PerspectiveCamera(52, 1, 0.1, 420);
+    R.camera.position.set(1.4, 1.45, 0);  // 승강장에 선 사람 눈높이, 선로에서 2m쯤 떨어진 곳
+    R.glows = []; R.lamps = []; R.wheels = [];
+    buildStation(); buildTrain(); buildParticles(); buildTickets();
+    resize();
+    renderer.compile(R.scene, R.camera);  // 셰이더를 미리 준비해 첫 프레임 끊김 방지
+  }
+
+  function glow(x, y, z, s, op, i) {
+    const m = new T.SpriteMaterial({ map: R.glowTex, color: 0xffcf7a, transparent: true, opacity: op, depthWrite: false, blending: T.AdditiveBlending, fog: false });
+    const sp = new T.Sprite(m); sp.position.set(x, y, z); sp.scale.set(s, s, 1); R.scene.add(sp);
+    R.lamps.push({ m, base: op * Math.max(0.3, 1 - Math.abs(z) / 260), ph: i * 1.7 });
+  }
+
+  function buildStation() {
+    const S = R.scene, L = 300, Z0 = 14, zc = Z0 - L / 2, W = 6.5, SPR = 6.2;
+    const lam = (o) => new T.MeshLambertMaterial(o), bas = (o) => new T.MeshBasicMaterial(o);
+    const add = (geo, mat, x, y, z) => { const m = new T.Mesh(geo, mat); m.position.set(x, y, z); S.add(m); return m; };
+    const mtx = new T.Matrix4();
+    // 빛(그림자 없음): 유리 지붕으로 드는 서늘한 낮빛 + 역 끝 역광 + 카메라 근처 따뜻한 가스등
+    S.add(new T.HemisphereLight(0xe6ecef, 0x2a1f18, 0.7));
+    const sky = new T.DirectionalLight(0xdfe8f0, 0.55); sky.position.set(1, 12, -4); sky.target.position.set(-2, 0, -8); S.add(sky, sky.target);
+    const back = new T.DirectionalLight(0xf2ead8, 0.5); back.position.set(2, 10, -90); back.target.position.set(-2, 1, 0); S.add(back, back.target);
+    const warm = new T.PointLight(0xffc27a, 1.3, 36); warm.position.set(3.5, 3.4, -4); S.add(warm);
+    // 승강장(오른쪽 아래) + 금색 가장자리선 + 선로 쪽 벽돌 단면
+    const floor = add(new T.PlaneGeometry(W + 0.4, L), lam({ map: slabTex(L) }), (W - 0.4) / 2, 0, zc); floor.rotation.x = -Math.PI / 2;
+    add(new T.BoxGeometry(0.14, 0.03, L), bas({ color: 0xc9a45c }), -0.33, 0.016, zc);
+    const face = add(new T.PlaneGeometry(L, 0.95), lam({ map: brickTex(L, 0.95), color: 0x9a7a6a }), -0.4, -0.475, zc); face.rotation.y = -Math.PI / 2;
+    // 선로
+    const bed = add(new T.PlaneGeometry(W - 0.4, L), lam({ color: 0x1e140c }), -(W + 0.4) / 2, -0.98, zc); bed.rotation.x = -Math.PI / 2;
+    for (const xr of [-2.72, -1.28]) add(new T.BoxGeometry(0.08, 0.14, L), lam({ color: 0x5e5248 }), xr, -0.88, zc);
+    const ns = Math.floor(L / 0.75), sl = new T.InstancedMesh(new T.BoxGeometry(2.5, 0.1, 0.24), lam({ color: 0x2b1b11 }), ns);
+    for (let i = 0; i < ns; i++) { mtx.makeTranslation(-2, -0.93, Z0 - i * 0.75); sl.setMatrixAt(i, mtx); }
+    S.add(sl);
+    // 벽돌 벽: 오른쪽은 소실점으로 이어지는 붉은 벽, 왼쪽은 어둡게
+    const wallR = add(new T.PlaneGeometry(L, SPR), lam({ map: brickTex(L, SPR) }), W, SPR / 2, zc); wallR.rotation.y = -Math.PI / 2;
+    const wallL = add(new T.PlaneGeometry(L, SPR + 1), lam({ map: brickTex(L, SPR + 1), color: 0x8a7468 }), -W, (SPR - 1) / 2, zc); wallL.rotation.y = Math.PI / 2;
+    // 아치형 유리 지붕 + 철골 아치(인스턴스로 한 번에 그림) + 기둥
+    const roof = add(new T.CylinderGeometry(W, W, L, 28, 1, true, Math.PI / 2, Math.PI), bas({ map: glassTex(L), side: T.BackSide }), 0, SPR, zc);
+    roof.rotation.x = Math.PI / 2;
+    const step = 9, nr = Math.floor((L - 10) / step);
+    const rib = new T.InstancedMesh(new T.TorusGeometry(W - 0.05, 0.11, 4, 22, Math.PI), lam({ color: 0x6b4a2a, emissive: 0x2a1a08 }), nr);
+    const col = new T.InstancedMesh(new T.BoxGeometry(0.22, 1, 0.22), lam({ color: 0x4a3018 }), nr * 2);
+    for (let i = 0; i < nr; i++) {
+      const z = Z0 - 4 - i * step;
+      mtx.makeTranslation(0, SPR, z); rib.setMatrixAt(i, mtx);
+      mtx.makeScale(1, SPR + 1, 1).setPosition(W - 0.12, (SPR - 1) / 2, z); col.setMatrixAt(i * 2, mtx);
+      mtx.makeScale(1, SPR + 1, 1).setPosition(-W + 0.12, (SPR - 1) / 2, z); col.setMatrixAt(i * 2 + 1, mtx);
+    }
+    S.add(rib, col);
+    // 가스등: 벽에 일정 간격 + 지붕에 매달린 등 (멀수록 작고 흐리게, 약하게 깜빡임)
+    R.glowTex = radial([[0, 'rgba(255,241,200,1)'], [0.25, 'rgba(255,207,122,.55)'], [1, 'rgba(255,170,80,0)']]);
+    const lampBody = bas({ color: 0xf2cf7a }), iron = lam({ color: 0x3b2416 });
+    let i = 0;
+    for (let z = -4; z > Z0 - L + 20; z -= 12, i++) {
+      add(new T.BoxGeometry(0.22, 0.36, 0.22), lampBody, W - 0.35, 3.3, z);
+      add(new T.BoxGeometry(0.5, 0.05, 0.05), iron, W - 0.2, 3.55, z);
+      glow(W - 0.4, 3.3, z, 3.2, 0.6, i);
+    }
+    for (let z = -10; z > Z0 - L + 20; z -= 18, i++) {
+      add(new T.BoxGeometry(0.03, 4.6, 0.03), iron, 1.8, 10.0, z);
+      add(new T.BoxGeometry(0.3, 0.4, 0.3), lampBody, 1.8, 7.6, z);
+      glow(1.8, 7.6, z, 3.4, 0.55, i);
+    }
+    // 초록 법랑 표지판 "Platform 20": 벽에 하나, 지붕 철골에 매달린 것 하나
+    const signM = bas({ map: signTex() });
+    for (const z of [-26, -98]) { const sg = add(new T.PlaneGeometry(2.3, 0.9), signM, W - 0.05, 3.9, z); sg.rotation.y = -Math.PI / 2; }
+    add(new T.PlaneGeometry(2.0, 0.78), signM, 3.6, 4.3, -16);
+    for (const dx of [-0.7, 0.7]) add(new T.BoxGeometry(0.03, 7, 0.03), iron, 3.6 + dx, 8.2, -16);
+    // 승강장의 사람들: 역광 실루엣, 멀수록 증기에 묻힘
+    const figs = [0, 1, 2].map(figureTex);
+    for (const [x, z, k, h] of [[4.2, -15, 1, 1.75], [2.9, -19, 0, 1.68], [5.0, -24, 2, 1.7], [3.4, -31, 0, 1.8], [4.6, -38, 1, 1.72], [2.4, -46, 0, 1.65], [5.3, -55, 0, 1.7], [3.8, -63, 2, 1.75]]) {
+      const sp = new T.Sprite(new T.SpriteMaterial({ map: figs[k], color: 0x1c1714, alphaTest: 0.5 }));
+      sp.center.set(0.5, 0); sp.position.set(x, 0, z); sp.scale.set(h * 0.5 * (k === 2 ? 1.35 : 1), h, 1); S.add(sp);
+    }
+    // 역광: 역 끝 출구로 드는 회백색 낮빛 + 큰 빛무리 + 증기에 비치는 빛줄기
+    const mouthM = bas({ color: 0xe8ecec, fog: false, transparent: true, opacity: 0.6 });
+    add(new T.CircleGeometry(W, 32, 0, Math.PI), mouthM, 0, SPR, Z0 - L + 0.5);
+    add(new T.PlaneGeometry(W * 2, SPR + 1), mouthM, 0, (SPR - 1) / 2, Z0 - L + 0.5);
+    R.glows.push({ m: mouthM, base: 0.6 });
+    const haloM = new T.SpriteMaterial({ map: R.glowTex, color: 0xdfe6ea, transparent: true, opacity: 0.32, depthWrite: false, blending: T.AdditiveBlending, fog: false });
+    const halo = new T.Sprite(haloM); halo.position.set(0, 4, Z0 - L + 30); halo.scale.set(90, 70, 1); S.add(halo);
+    R.glows.push({ m: haloM, base: 0.32 });
+    const st = shaftTex();
+    for (const [x, z, rz] of [[-1.5, -34, 0.32], [1.2, -55, 0.3], [-0.4, -82, 0.34], [2.2, -118, 0.28], [0.4, -160, 0.3]]) {
+      const m = bas({ map: st, color: 0xf2eee6, transparent: true, opacity: 0.14, depthWrite: false, blending: T.AdditiveBlending, fog: false, side: T.DoubleSide });
+      const p = add(new T.PlaneGeometry(2.6, 15), m, x, 5.5, z); p.rotation.z = rz;
+      R.glows.push({ m, base: 0.14 });
+    }
+  }
+
+  // 기관차 1 + 탄수차 1 + 객차 3. 카메라 쪽(+x) 옆면만 자세히 만든다(반대쪽은 보이지 않음)
+  function buildTrain() {
+    const g = new T.Group(); g.position.set(-2, -0.81, -200); R.scene.add(g); R.train = g;
+    const lam = (c, e) => new T.MeshLambertMaterial({ color: c, emissive: e || 0 });
+    // 광택 도장: 진홍 차체·검은 연기실은 반들반들하게(실시간 그림자 없이 하이라이트만)
+    const gloss = (c, spec, sh) => new T.MeshPhongMaterial({ color: c, specular: spec, shininess: sh });
+    const red = gloss(0x8b1a2b, 0x6a4040, 60), dark = gloss(0x141014, 0x5a5a5a, 90), brass = gloss(0xc9a45c, 0xfff0c0, 80);
+    const roofM = lam(0x1d1724), under = lam(0x17121c), door = gloss(0x2a0e14, 0x402020, 40);
+    const win = new T.MeshBasicMaterial({ color: 0xffd98a });
+    const put = (geo, m, x, y, z, rx, ry) => { const o = new T.Mesh(geo, m); o.position.set(x, y, z); if (rx) o.rotation.x = rx; if (ry) o.rotation.y = ry; g.add(o); return o; };
+    const box = (w, h, d, m, x, y, z) => put(new T.BoxGeometry(w, h, d), m, x, y, z);
+    const cylZ = (r, len, m, x, y, z, seg) => put(new T.CylinderGeometry(r, r, len, seg || 24), m, x, y, z, Math.PI / 2);
+    const cylY = (r1, r2, h, m, x, y, z) => put(new T.CylinderGeometry(r1, r2, h, 20), m, x, y, z);
+    const sideWin = (w, h, x, y, z, m) => put(new T.PlaneGeometry(w, h), m || win, x, y, z, 0, Math.PI / 2);
+    const wheelMat = new T.MeshLambertMaterial({ map: wheelTex(), emissive: 0x100c08 });
+    const wheel = (r, z) => {
+      const p = new T.Object3D(); p.position.set(1.22, r, z);
+      const m = new T.Mesh(new T.CylinderGeometry(r, r, 0.12, 28), wheelMat); m.rotation.z = Math.PI / 2;
+      p.add(m); g.add(p); R.wheels.push({ p, r });
+    };
+    // 기관차 (앞 = z 0)
+    box(2.7, 0.45, 0.25, red, 0, 1.0, -0.15);
+    for (const s of [-1, 1]) {
+      cylZ(0.14, 0.35, dark, s * 0.9, 1.0, 0.1, 12); cylZ(0.22, 0.06, brass, s * 0.9, 1.0, 0.28, 16);
+      box(0.24, 0.26, 0.2, win, s * 0.55, 1.5, -0.1);
+    }
+    box(2.6, 0.25, 9.6, under, 0, 1.25, -5.0);
+    cylZ(0.92, 1.4, dark, 0, 2.15, -0.95);                                    // 연기실
+    put(new T.CircleGeometry(0.84, 32), lam(0x1b161c), 0, 2.15, -0.24);       // 둥근 앞문
+    put(new T.TorusGeometry(0.84, 0.05, 6, 32), brass, 0, 2.15, -0.24);
+    put(new T.CircleGeometry(0.36, 32), new T.MeshBasicMaterial({ map: plateTex() }), 0, 2.2, -0.21);  // 번호판 2026
+    cylZ(0.85, 5.2, red, 0, 2.15, -4.25);                                     // 보일러
+    for (const z of [-2.2, -4.0, -5.8]) cylZ(0.875, 0.14, brass, 0, 2.15, z); // 금색 띠 3줄
+    cylY(0.3, 0.26, 1.1, dark, 0, 3.55, -0.95); cylY(0.42, 0.32, 0.2, dark, 0, 4.15, -0.95);  // 연기통
+    cylY(0.38, 0.42, 0.45, brass, 0, 3.2, -3.4);                              // 증기돔
+    put(new T.SphereGeometry(0.38, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2), brass, 0, 3.42, -3.4);
+    for (const s of [-1, 1]) box(0.5, 0.55, 1.4, red, s * 1.2, 1.0, -1.5);   // 실린더
+    box(2.75, 2.5, 2.6, red, 0, 2.55, -8.1); box(3.0, 0.14, 3.0, roofM, 0, 3.86, -8.1);  // 기관실
+    sideWin(0.8, 0.75, 1.38, 2.95, -7.6);
+    for (const s of [-1, 1]) put(new T.PlaneGeometry(0.55, 0.5), win, s * 0.85, 3.25, -6.79);
+    box(0.02, 0.06, 2.6, brass, 1.38, 1.9, -8.1);
+    for (const z of [-3.1, -5.0, -6.9]) wheel(0.95, z);                       // 큰 동륜 3쌍
+    wheel(0.5, -0.9); wheel(0.5, -9.0);
+    R.coupling = box(0.07, 0.12, 4.0, brass, 1.34, 0.95, -5.0);               // 동륜 연결봉
+    R.mainRod = box(0.07, 0.12, 1, brass, 1.4, 0.95, -3.6);                   // 실린더 → 동륜
+    const headM = new T.SpriteMaterial({ map: R.glowTex, color: 0xffe2a0, transparent: true, opacity: 0.95, depthWrite: false, blending: T.AdditiveBlending, fog: false });
+    const head = new T.Sprite(headM); head.position.set(0, 1.5, 0.35); head.scale.set(6, 6, 1); g.add(head); R.headM = headM;
+    box(2.2, 1.6, 0.7, under, 0, 2.2, -9.75);                                  // 연결부
+    // 탄수차
+    box(2.7, 2.1, 6.0, red, 0, 2.15, -13.1); box(2.4, 0.3, 5.4, dark, 0, 3.3, -13.1);
+    box(0.02, 0.06, 6.0, brass, 1.36, 2.6, -13.1); box(2.5, 0.3, 6.0, under, 0, 0.95, -13.1);
+    for (const z of [-11.0, -12.2, -14.0, -15.2]) wheel(0.48, z);
+    box(2.2, 2.0, 0.9, under, 0, 2.2, -16.55);
+    // 객차 3량: 둥근 지붕, 창문 7개, 금색 가로선 2줄, 대차 2개
+    let front = -17.0;
+    for (let k = 0; k < 3; k++) {
+      const zc = front - 7;
+      box(2.8, 2.5, 14, red, 0, 2.35, zc);
+      const rf = put(new T.CylinderGeometry(1.45, 1.45, 14, 16, 1, false, Math.PI / 2, Math.PI), roofM, 0, 3.6, zc, Math.PI / 2);
+      rf.scale.set(1, 1, 0.38);
+      box(0.02, 0.05, 14, brass, 1.405, 1.75, zc); box(0.02, 0.05, 14, brass, 1.405, 3.3, zc);
+      for (let j = 0; j < 7; j++) sideWin(0.9, 0.72, 1.41, 2.55, zc + (j - 3) * 1.75);
+      for (const e of [-1, 1]) sideWin(0.7, 1.9, 1.41, 2.15, zc + e * 6.35, door);
+      box(2.6, 0.35, 13, under, 0, 0.95, zc);
+      for (const b of [-4.8, 4.8]) { wheel(0.45, zc + b - 0.9); wheel(0.45, zc + b + 0.9); box(0.08, 0.25, 2.8, under, 1.32, 0.5, zc + b); }
+      if (k < 2) box(2.2, 2.2, 0.9, under, 0, 2.3, front - 14.45);
+      front -= 14.9;
+    }
+    box(0.2, 0.2, 0.05, new T.MeshBasicMaterial({ color: 0xff4a30 }), 1.0, 1.5, front + 0.87);  // 꼬리등
+  }
+
+  function buildParticles() {
+    const puff = radial([[0, 'rgba(255,255,255,1)'], [0.55, 'rgba(255,255,255,.45)'], [1, 'rgba(255,255,255,0)']]);
+    const cloud = cloudTex();
+    const sprite = (op, map) => {
+      const m = new T.SpriteMaterial({ map: map || puff, color: 0xf7f5f0, transparent: true, opacity: op, depthWrite: false });
+      const s = new T.Sprite(m); R.scene.add(s); return { s, m, life: 0, max: 1, v: new T.Vector3(), size: 1, grow: 1, op };
+    };
+    const pool = (n, map) => Array.from({ length: n }, () => { const q = sprite(0, map); q.s.visible = false; return q; });
+    R.smoke = pool(128, cloud);  // 연기통에서 뭉게뭉게 피어올라 뒤로 길게
+    R.wash = pool(28, cloud);    // 기관차가 스칠 때 카메라 앞으로 휘몰아치는 연기 (기차와 겹쳐도 가장자리가 잘리지 않게 맨 위에 그림)
+    for (const q of R.wash) { q.m.depthTest = false; q.s.renderOrder = 10; }
+    R.side = pool(40, cloud);    // 실린더 쪽에서 승강장으로 뿜어 나오는 하얀 증기
+    // 지붕 아래 이미 떠 있는 증기 구름 (기차가 지나가면 흔들림)
+    R.clouds = Array.from({ length: 12 }, () => {
+      const q = sprite(0, cloud);
+      q.s.position.set(rnd(-5, 3), rnd(3.6, 7), rnd(-70, -8));
+      const sz = rnd(8, 15); q.s.scale.set(sz * 1.4, sz, 1);
+      q.base = rnd(0.12, 0.22); q.spin = rnd(-0.15, 0.15); q.m.rotation = rnd(0, 6.28);
+      return q;
+    });
+    // 바닥에 깔린 증기
+    R.floor = Array.from({ length: 18 }, (_, k) => {
+      const q = sprite(0), onTrack = k % 4 === 0;
+      q.home = new T.Vector3(onTrack ? rnd(-3.2, -0.8) : rnd(-0.8, 5), onTrack ? rnd(-0.6, -0.2) : rnd(0.15, 0.5), rnd(-45, -1.5));
+      q.s.position.copy(q.home);
+      q.s.scale.set(rnd(5, 10), rnd(1.2, 2.2), 1);
+      q.base = rnd(0.08, 0.16); q.spin = rnd(-0.6, 0.6);
+      return q;
+    });
+  }
+
+  function buildTickets() {
+    const front = tex(drawTicket(true)), back = tex(drawTicket(false));
+    const geo = new T.PlaneGeometry(0.78, 0.429);
+    R.tix = Array.from({ length: 20 }, () => {
+      const g = new T.Group();
+      const mf = new T.MeshBasicMaterial({ map: front, transparent: true, depthWrite: false, fog: false });
+      const mb = new T.MeshBasicMaterial({ map: back, transparent: true, depthWrite: false, fog: false });
+      const f = new T.Mesh(geo, mf), b = new T.Mesh(geo, mb); b.rotation.y = Math.PI;
+      g.add(f, b); g.visible = false; R.scene.add(g);
+      return { g, mf, mb };
+    });
+  }
+
+  // 화면 크기·해상도(최대 2배) 맞춤. 소실점이 가운데보다 약간 오른쪽(가로 약 67%, 세로 45%)에 오도록 렌즈를 옮긴다
+  function resize() {
+    const pad = 12, w = innerWidth + pad * 2, h = innerHeight + pad * 2, a = w / h, cam = R.camera;
+    R.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, R.lowRes ? 1 : 2));
+    R.renderer.setSize(w, h, false);
+    R.canvas.style.width = w + 'px'; R.canvas.style.height = h + 'px';
+    cam.aspect = a; cam.fov = a < 1 ? 66 : 50; cam.updateProjectionMatrix();
+    const e = cam.projectionMatrix.elements;
+    e[8] = -(a < 1 ? 0.18 : 0.35); e[9] = -0.1;
+    cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+  }
+
+  function emit(pool, x, y, z, vx, vy, vz, max, size, grow, op) {
+    const q = pool.find((p) => !p.s.visible); if (!q) return;
+    q.s.visible = true; q.s.position.set(x, y, z); q.v.set(vx, vy, vz);
+    q.life = 0; q.max = max; q.size = size; q.grow = grow; q.op = op;
+    q.m.rotation = Math.random() * 6.28;
+  }
+  function stepPool(pool, dt) {
+    for (const q of pool) {
+      if (!q.s.visible) continue;
+      q.life += dt;
+      const u = q.life / q.max;
+      if (u >= 1) { q.s.visible = false; continue; }
+      q.s.position.addScaledVector(q.v, dt); q.v.multiplyScalar(1 - 1.6 * dt);
+      const sz = q.size + q.grow * q.life; q.s.scale.set(sz, sz, 1);
+      q.m.opacity = q.op * Math.min(1, u * 8) * Math.pow(1 - u, 1.3);
+    }
+  }
+
+  // 3초 연출. cb.onHero는 2.4초에 불려 실제 티켓(DOM)을 가운데로 데려온다
+  function play(cb) {
+    if (state !== 'ready') return false;
+    state = 'playing';
+    const { renderer, scene, camera, canvas, train } = R;
+    resize(); addEventListener('resize', resize);
+    canvas.classList.add('on'); canvas.style.opacity = '0';
+    document.body.style.overflow = 'hidden';
+    const V = 62, TAIL = 60.8;
+    // 기차 앞머리 위치(카메라 = z 0): 0.6초에 카메라를 지나고, 그 전엔 멀리서 빠르게 다가옴
+    const front = (t) => { if (t >= 0.6) return V * (t - 0.6); const k = 0.6 - t; return -(k * V + 202 * k * k); };
+    const plan = [];
+    let N = 20, measured = false, frames = 0, heroCalled = false, ended = false, accS = 0, accW = 0, accW2 = 0;
+    const t0 = performance.now(); let last = t0;
+
+    function schedule(n) {
+      for (let i = 0; i < n; i++) {
+        const ts = 1.6 + i * (0.4 / n), nearVP = i % 3 === 2, exit = i % 3 !== 1;  // 약 2/3는 화면 밖으로, 나머지는 사라짐
+        // 출발: 기차가 지나간 선로 위(화면 왼쪽 안쪽)와 소실점 근처. 도착: 카메라 바로 옆을 스쳐 화면 밖으로
+        const cx = camera.position.x, cy = camera.position.y;
+        const p0 = nearVP ? new T.Vector3(rnd(0, 2.6), rnd(1.6, 3.6), rnd(-34, -22)) : new T.Vector3(rnd(-2.2, 0.6), rnd(0.8, 3.2), rnd(-13, -4));
+        const p1 = exit
+          ? new T.Vector3(cx + (Math.random() < 0.6 ? -rnd(0.5, 1.0) : rnd(0.3, 0.8)), cy + rnd(-0.6, 0.6), -0.3)
+          : p0.clone().lerp(new T.Vector3(cx + rnd(-1, 1), cy + rnd(-0.4, 0.8), -1.5), rnd(0.4, 0.7));
+        plan.push({ ts, D: Math.min(rnd(0.6, 0.95), 2.92 - ts), p0, p1, exit, spin: rnd(-4, 4), flip: rnd(4, 11) * (Math.random() < 0.5 ? -1 : 1),
+          sway: rnd(0.3, 0.9), ph: rnd(0, 6.28), wob: rnd(5, 9), tk: R.tix[i] });
+      }
+    }
+    function finish() {
+      if (ended) return; ended = true;
+      removeEventListener('resize', resize);
+      document.body.style.overflow = '';
+      canvas.classList.remove('on'); canvas.style.transform = '';
+      try { renderer.dispose(); renderer.forceContextLoss(); } catch (e) {}
+      canvas.remove(); R = null; state = 'done';
+      if (!heroCalled) { heroCalled = true; cb.onHero(); }
+    }
+    function frame(now) {
+      try {
+        const t = (now - t0) / 1000, dt = Math.min((now - last) / 1000, 0.05); last = now;
+        // 처음 0.3초 동안 부드러움을 재서 티켓 장수·해상도 조절 (3초 타이밍은 그대로)
+        if (!measured) {
+          frames++;
+          if (t >= 0.3) {
+            measured = true;
+            const fps = frames / t;
+            if (fps < 35) { N = 6; R.lowRes = true; resize(); } else if (fps < 45) N = 12;
+            schedule(N);
+          }
+        }
+        // 3D 화면: 0.2초에 걸쳐 나타나고 2.55~2.95초에 걷혀서 실제 페이지가 드러남
+        canvas.style.opacity = String(t < 2.55 ? smooth(t / 0.2) : 1 - smooth((t - 2.55) / 0.4));
+        // 기차·바퀴·연결봉
+        const z = front(t);
+        train.position.z = z;
+        for (const w of R.wheels) w.p.rotation.x = z / w.r;
+        const a = z / 0.95, cr = 0.42;
+        R.coupling.position.y = 0.95 + cr * Math.cos(a); R.coupling.position.z = -5.0 + cr * Math.sin(a);
+        const ay = 0.95, az = -2.3 + cr * Math.sin(a) * 0.6, by = 0.95 + cr * Math.cos(a), bz = -5.0 + cr * Math.sin(a);
+        R.mainRod.position.set(1.4, (ay + by) / 2, (az + bz) / 2);
+        R.mainRod.scale.z = Math.hypot(by - ay, bz - az);
+        R.mainRod.rotation.x = Math.atan2(-(by - ay), bz - az);
+        R.headM.opacity = 0.95 * (1 - smooth((t - 0.55) / 0.3));
+        // 0~0.2초 역광이 밝아지고, 가스등은 약하게 깜빡임
+        const lit = 0.65 + 0.35 * smooth(t / 0.2);
+        for (const gl of R.glows) gl.m.opacity = gl.base * lit;
+        for (const l of R.lamps) l.m.opacity = l.base * lit * (0.9 + 0.1 * Math.sin(now / 90 + l.ph) * Math.sin(now / 37 + l.ph * 2));
+        // 연기·증기
+        const wx = train.position.x, wy = train.position.y, rate = R.lowRes ? 40 : 70;
+        const carry = 0.8 * (t >= 0.6 ? V : V + 404 * (0.6 - t));  // 갓 뿜은 연기는 기차 속도를 잠깐 따라가다 뒤로 처짐
+        if (t < 1.9 && z > -140) {
+          accS += dt * rate;
+          // 카메라 쪽(+x)으로 퍼지며 크게 부풀어서, 기관차가 스칠 때 화면 위를 덮음
+          for (; accS >= 1; accS--) emit(R.smoke, wx + rnd(-0.15, 0.15), wy + 4.25, z - 0.95, rnd(0.3, 1.8), rnd(3, 5.5), carry + rnd(-3, 3), rnd(1.4, 2.1), rnd(2.4, 3.4), rnd(6, 9), rnd(0.65, 0.9));
+        }
+        // 기관차가 스치는 순간(0.55~0.95초): 연기가 기차 몸통 너머에서 카메라 앞 위쪽으로 휘몰아쳐 화면 위를 덮음
+        if (t > 0.55 && t < 0.95) {
+          accW2 += dt * (R.lowRes ? 20 : 34);
+          for (; accW2 >= 1; accW2--) emit(R.wash, rnd(-0.4, 1.0), rnd(1.9, 2.7), rnd(-3.5, -1.0), rnd(-0.2, 0.6), rnd(-0.4, 0.1), rnd(3, 6), rnd(0.5, 0.8), rnd(1.0, 1.8), rnd(1.8, 2.8), rnd(0.35, 0.5));
+        }
+        if (t < 1.0 && z > -90) {
+          accW += dt * (R.lowRes ? 18 : 30);
+          for (; accW >= 1; accW--) emit(R.side, wx + 1.45, wy + rnd(0.6, 1.2), z - rnd(1.0, 2.0), rnd(2, 4.5), rnd(0.3, 1.2), carry + rnd(-1.5, 1.5), rnd(0.8, 1.3), rnd(0.8, 1.2), rnd(3.5, 5), rnd(0.45, 0.65));
+        }
+        stepPool(R.smoke, dt); stepPool(R.side, dt); stepPool(R.wash, dt);
+        // 바닥 증기: 짙어졌다가 기차가 지나갈 때 휘몰아치고 가라앉음
+        const boost = t < 0.2 ? smooth(t / 0.2) * 0.5 : t < 0.6 ? 0.5 : t < 1.9 ? 1 : Math.max(0.25, 1 - (t - 1.9) / 1.1);
+        const passing = t > 0.6 && z - TAIL < 2;
+        for (const q of R.floor) {
+          if (passing) { q.v.x += rnd(-1, 1) * 6 * dt; q.v.z += 9 * dt; q.v.y += rnd(-0.2, 0.6) * dt; }
+          q.v.multiplyScalar(1 - 1.2 * dt);
+          q.s.position.addScaledVector(q.v, dt);
+          q.m.rotation += dt * q.spin * (0.3 + boost);
+          q.m.opacity = Math.min(0.5, q.base * (1 + 2.4 * boost));
+        }
+        for (const q of R.clouds) {
+          if (passing) { q.v.x += rnd(-1, 1) * 2 * dt; q.v.z += 4 * dt; }
+          q.v.multiplyScalar(1 - 0.8 * dt); q.s.position.addScaledVector(q.v, dt);
+          q.m.rotation += dt * q.spin * (1 + 2 * boost);
+          q.m.opacity = q.base * (0.8 + 0.5 * boost);
+        }
+        // 화면 떨림: 0.3초 시작 → 0.6~0.9초 최대(좌우 약 4px) → 1.7초 끝
+        const amp = t < 0.3 ? 0 : t < 0.6 ? 1.5 * (t - 0.3) / 0.3 : t < 0.9 ? 4 : t < 1.7 ? 4 * Math.pow(1 - (t - 0.9) / 0.8, 1.4) : 0;
+        canvas.style.transform = amp ? `translate(${(amp * Math.sin(t * 97) * (0.6 + 0.4 * Math.sin(t * 31))).toFixed(2)}px, ${(amp * 0.35 * Math.sin(t * 71)).toFixed(2)}px)` : '';
+        // 티켓: 기차 뒤 바람에 일어나 정면으로 쏟아짐
+        for (const q of plan) {
+          const age = t - q.ts, g = q.tk.g;
+          if (age < 0 || age > q.D) { g.visible = false; continue; }
+          const u = age / q.D, e = q.exit ? Math.pow(u, 1.7) : 1 - Math.pow(1 - u, 2);
+          g.visible = true;
+          g.position.lerpVectors(q.p0, q.p1, e);
+          g.position.x += Math.sin(age * q.wob + q.ph) * 0.12 * (1 - u * 0.5);
+          g.position.y += Math.cos(age * q.wob * 0.8 + q.ph) * 0.1 + age * 0.4;
+          g.rotation.set(q.flip * age, Math.sin(age * 3 + q.ph) * q.sway, q.spin * age + q.ph);
+          const op = Math.min(1, age / 0.08) * (q.exit ? 1 : 1 - smooth((u - 0.35) / 0.65));
+          q.tk.mf.opacity = q.tk.mb.opacity = op;
+        }
+        // 2.4초: 주인공 티켓(실제 버튼)이 속도를 줄이며 가운데로
+        if (!heroCalled && t >= 2.4) { heroCalled = true; cb.onHero(); }
+        renderer.render(scene, camera);
+        if (t >= 3.0) finish(); else requestAnimationFrame(frame);
+      } catch (e) { console.warn('3D 연출 중 오류로 바로 티켓을 보여 줍니다.', e); finish(); }
+    }
+    requestAnimationFrame(frame);
+    return true;
+  }
+
+  return { load, play, ready: () => state === 'ready' };
+})();
+
 // ── 탑승하기: 0~0.2초 증기 짙어짐 → 0.2~1.8초 기차 통과 → 0.3~1.6초 화면 흔들림 ──
 (function () {
   const board = document.getElementById('board');
@@ -644,6 +1253,12 @@ document.getElementById('copy-url').addEventListener('click', async () => {
     if (running) return;
     if (reduce) { landNow(); return; }
     running = true; board.disabled = true;
+    if (Rail3D.play({ onHero: heroLand })) { setTimeout(() => boarding.classList.add('leaving'), 200); return; }
+    run2D();
+  });
+
+  // v27 2D 연출: three.js를 못 불러왔거나 WebGL을 쓸 수 없을 때
+  function run2D() {
     const isPhone = innerWidth < 600, th = isPhone ? 190 : 290, room = th + 260;
     const bottom = Math.min(860, scrollY + innerHeight - 8);
     track.style.top = (bottom - room) + 'px'; track.style.height = room + 'px';
@@ -684,7 +1299,30 @@ document.getElementById('copy-url').addEventListener('click', async () => {
     requestAnimationFrame(tick);
     setTimeout(() => boarding.classList.add('leaving'), 1300);
     setTimeout(flyTicket, 1500);
-  });
+  }
+
+  // ── 3D 연출의 주인공 티켓: 2.4초에 쏟아지는 무리 속에서 나와 속도를 줄이며 2.9초에 제자리에 멈춤 ──
+  // 처음부터 실제 티켓 버튼이 날아오므로, 멈추는 순간 그대로 누를 수 있는 티켓이 된다.
+  function heroLand() {
+    boarding.classList.add('gone');
+    stage.hidden = false;
+    let r = fly.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > innerHeight) {  // 아래로 내려가 있었다면 티켓이 화면 가운데 오도록 (3D 화면에 가려 보이지 않음)
+      window.scrollTo({ top: scrollY + r.top + r.height / 2 - innerHeight / 2, behavior: 'instant' });
+      r = fly.getBoundingClientRect();
+    }
+    const sx = innerWidth * 0.4 - (r.left + r.width / 2), sy = innerHeight * 0.42 - (r.top + r.height / 2);
+    const f = (x, y, s, rz, rx, ry) => `translate(${x}px, ${y}px) scale(${s}) rotate(${rz}deg) rotateX(${rx}deg) rotateY(${ry}deg)`;
+    fly.classList.add('flying');
+    const a = fly.animate([
+      { transform: f(sx, sy, 0.16, -40, 60, -200), opacity: 0 },
+      { transform: f(sx * 0.8, sy * 0.8 - 10, 0.3, -32, 45, -150), opacity: 1, offset: 0.12 },
+      { transform: f(sx * 0.3, sy * 0.3 - 30, 0.72, -12, 18, -40), offset: 0.5 },
+      { transform: f(0, -8, 1.03, 2, 0, 0), offset: 0.84 },
+      { transform: f(0, 0, 1, 0, 0, 0) },
+    ], { duration: 500, easing: 'cubic-bezier(.15,.65,.25,1)', fill: 'forwards' });
+    a.onfinish = () => { a.cancel(); fly.style.transform = 'none'; fly.classList.remove('flying'); floatEl.classList.add('landed'); stage.classList.add('done'); };
+  }
 
   // ── 티켓: 1.5초에 기차 바람에 날려 들어와 2.7~3.0초에 가운데 멈춤 ──
   const boarding = document.querySelector('.boarding');
@@ -719,6 +1357,12 @@ document.getElementById('copy-url').addEventListener('click', async () => {
   }
   document.getElementById('skip').addEventListener('click', () => { if (!running) landNow(); });
 })();
+
+// 동작 줄이기를 켠 사람은 3D를 쓰지 않으므로 불러오지도 않는다
+if (!reduce) {
+  if (document.readyState === 'complete') Rail3D.load();
+  else addEventListener('load', () => Rail3D.load());
+}
 </script>
 </body>
 </html>
